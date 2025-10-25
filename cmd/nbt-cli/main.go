@@ -3,11 +3,11 @@ package main
 import (
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+
+	"github.com/spf13/cobra"
 
 	"nbt-cli/internal/anvil"
 	"nbt-cli/internal/chunkedit"
@@ -22,12 +22,233 @@ type commonFlags struct {
 	z          int
 }
 
-func parseCommon(fs *flag.FlagSet, cf *commonFlags) {
-	fs.StringVar(&cf.regionDir, "region-dir", "", "Path to region directory containing r.*.*.mca")
-	fs.StringVar(&cf.regionFile, "region-file", "", "Path to single region file .mca")
-	fs.IntVar(&cf.x, "x", 0, "Block X coordinate")
-	fs.IntVar(&cf.y, "y", 0, "Block Y coordinate")
-	fs.IntVar(&cf.z, "z", 0, "Block Z coordinate")
+type exitCoder interface {
+	error
+	ExitCode() int
+}
+
+type cliError struct {
+	code int
+	err  error
+}
+
+func (e *cliError) Error() string {
+	if e.err == nil {
+		return ""
+	}
+	return e.err.Error()
+}
+
+func (e *cliError) ExitCode() int {
+	return e.code
+}
+
+func exitError(code int, err error) error {
+	return &cliError{code: code, err: err}
+}
+
+func exitErrorf(code int, format string, args ...any) error {
+	return exitError(code, fmt.Errorf(format, args...))
+}
+
+func newRootCmd() *cobra.Command {
+	root := &cobra.Command{
+		Use:           "nbt-cli",
+		Short:         "Minecraft NBT map editor for block entities",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+	}
+
+	root.AddCommand(newMapCmd())
+
+	return root
+}
+
+func newMapCmd() *cobra.Command {
+	cf := &commonFlags{}
+	cmd := &cobra.Command{
+		Use:   "map",
+		Short: "Manage block entity data within region files",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return cmd.Help()
+		},
+	}
+
+	cmd.PersistentFlags().StringVar(&cf.regionDir, "region-dir", "", "Path to region directory containing r.*.*.mca")
+	cmd.PersistentFlags().StringVar(&cf.regionFile, "region-file", "", "Path to single region file .mca")
+	cmd.PersistentFlags().IntVar(&cf.x, "x", 0, "Block X coordinate")
+	cmd.PersistentFlags().IntVar(&cf.y, "y", 0, "Block Y coordinate")
+	cmd.PersistentFlags().IntVar(&cf.z, "z", 0, "Block Z coordinate")
+
+	cmd.AddCommand(
+		newMapGetCmd(cf),
+		newMapCreateCmd(cf),
+		newMapDeleteCmd(cf),
+	)
+
+	return cmd
+}
+
+func newMapGetCmd(cf *commonFlags) *cobra.Command {
+	var printRegion bool
+
+	cmd := &cobra.Command{
+		Use:   "get",
+		Short: "Inspect the block entity at the given coordinates",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runMapGet(cf, printRegion)
+		},
+	}
+
+	cmd.Flags().BoolVar(&printRegion, "print-region", false, "Also print region path to stdout on second line")
+
+	return cmd
+}
+
+func newMapCreateCmd(cf *commonFlags) *cobra.Command {
+	var (
+		id          string
+		data        string
+		dataFile    string
+		printRegion bool
+	)
+
+	cmd := &cobra.Command{
+		Use:   "create",
+		Short: "Create or update a block entity at the given coordinates",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runMapCreate(cf, id, data, dataFile, printRegion)
+		},
+	}
+
+	cmd.Flags().StringVar(&id, "id", "", "Block entity id (e.g. minecraft:chest)")
+	cmd.Flags().StringVar(&data, "data", "", "JSON for extra NBT fields")
+	cmd.Flags().StringVar(&dataFile, "data-file", "", "Path to JSON file for extra NBT fields")
+	cmd.Flags().BoolVar(&printRegion, "print-region", false, "Also print region path to stdout on second line")
+
+	return cmd
+}
+
+func newMapDeleteCmd(cf *commonFlags) *cobra.Command {
+	var printRegion bool
+
+	cmd := &cobra.Command{
+		Use:   "delete",
+		Short: "Delete the block entity at the given coordinates",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runMapDelete(cf, printRegion)
+		},
+	}
+
+	cmd.Flags().BoolVar(&printRegion, "print-region", false, "Also print region path to stdout on second line")
+
+	return cmd
+}
+
+func runMapGet(cf *commonFlags, printRegion bool) error {
+	r, path, err := openRegion(cf)
+	if err != nil {
+		return exitErrorf(1, "open region: %w", err)
+	}
+	defer r.Close()
+
+	chunk, _, _, _, _, err := loadChunk(r, cf.x, cf.z)
+	if err != nil {
+		return exitErrorf(1, "load chunk: %w", err)
+	}
+
+	ent, ok := chunkedit.GetBlockEntity(chunk, cf.x, cf.y, cf.z)
+	if !ok {
+		return exitErrorf(2, "not found at (%d,%d,%d) in %s", cf.x, cf.y, cf.z, path)
+	}
+
+	out, err := json.MarshalIndent(ent, "", "  ")
+	if err != nil {
+		return exitErrorf(1, "encode entity: %w", err)
+	}
+
+	fmt.Println(string(out))
+	if printRegion {
+		fmt.Println("region:", path)
+	} else {
+		fmt.Fprintln(os.Stderr, "region:", path)
+	}
+
+	return nil
+}
+
+func runMapCreate(cf *commonFlags, id, data, dataFile string, printRegion bool) error {
+	if data == "" && dataFile != "" {
+		contents, err := os.ReadFile(dataFile)
+		if err != nil {
+			return exitErrorf(1, "read data file: %w", err)
+		}
+		data = string(contents)
+	}
+
+	r, path, err := openRegion(cf)
+	if err != nil {
+		return exitErrorf(1, "open region: %w", err)
+	}
+	defer r.Close()
+
+	chunk, cx, cz, _, _, err := loadChunk(r, cf.x, cf.z)
+	if err != nil {
+		return exitErrorf(1, "load chunk: %w", err)
+	}
+
+	extra := map[string]any{}
+	if err := chunkedit.MergeJSONData(extra, data); err != nil {
+		return exitErrorf(1, "merge data: %w", err)
+	}
+
+	chunkedit.CreateOrUpdateBlockEntity(chunk, cf.x, cf.y, cf.z, id, extra)
+
+	if err := r.WriteChunkNBT(cx, cz, chunk); err != nil {
+		return exitErrorf(1, "write chunk: %w", err)
+	}
+
+	fmt.Println("ok")
+	if printRegion {
+		fmt.Println("region:", path)
+	} else {
+		fmt.Fprintln(os.Stderr, "region:", path)
+	}
+
+	return nil
+}
+
+func runMapDelete(cf *commonFlags, printRegion bool) error {
+	r, path, err := openRegion(cf)
+	if err != nil {
+		return exitErrorf(1, "open region: %w", err)
+	}
+	defer r.Close()
+
+	chunk, cx, cz, _, _, err := loadChunk(r, cf.x, cf.z)
+	if err != nil {
+		return exitErrorf(1, "load chunk: %w", err)
+	}
+
+	if !chunkedit.DeleteBlockEntity(chunk, cf.x, cf.y, cf.z) {
+		return exitErrorf(2, "not found at (%d,%d,%d)", cf.x, cf.y, cf.z)
+	}
+
+	if err := r.WriteChunkNBT(cx, cz, chunk); err != nil {
+		return exitErrorf(1, "write chunk: %w", err)
+	}
+
+	fmt.Println("ok")
+	if printRegion {
+		fmt.Println("region:", path)
+	} else {
+		fmt.Fprintln(os.Stderr, "region:", path)
+	}
+
+	return nil
 }
 
 func openRegion(cf *commonFlags) (*anvil.Region, string, error) {
@@ -52,162 +273,16 @@ func loadChunk(r *anvil.Region, x, z int) (map[string]any, int, int, int, int, e
 	return chunk, cx, cz, cxAbs, czAbs, err
 }
 
-func cmdMapGet(args []string) int {
-	fs := flag.NewFlagSet("map get", flag.ExitOnError)
-	var cf commonFlags
-    var printRegion bool
-	parseCommon(fs, &cf)
-    fs.BoolVar(&printRegion, "print-region", false, "Also print region path to stdout on second line")
-	fs.Parse(args)
-	r, path, err := openRegion(&cf)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
-	}
-	defer r.Close()
-	chunk, _, _, _, _, err := loadChunk(r, cf.x, cf.z)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
-	}
-	ent, ok := chunkedit.GetBlockEntity(chunk, cf.x, cf.y, cf.z)
-	if !ok {
-		fmt.Fprintf(os.Stderr, "not found at (%d,%d,%d) in %s\n", cf.x, cf.y, cf.z, path)
-		return 2
-	}
-	out, _ := json.MarshalIndent(ent, "", "  ")
-	fmt.Println(string(out))
-	if printRegion {
-		fmt.Println("region:", path)
-	} else {
-		fmt.Fprintln(os.Stderr, "region:", path)
-	}
-	return 0
-}
-
-func cmdMapCreate(args []string) int {
-	fs := flag.NewFlagSet("map create", flag.ExitOnError)
-	var cf commonFlags
-	var id string
-	var data string
-	var dataFile string
-    var printRegion bool
-	parseCommon(fs, &cf)
-	fs.StringVar(&id, "id", "", "Block entity id (e.g. minecraft:chest)")
-	fs.StringVar(&data, "data", "", "JSON for extra NBT fields")
-	fs.StringVar(&dataFile, "data-file", "", "Path to JSON file for extra NBT fields")
-    fs.BoolVar(&printRegion, "print-region", false, "Also print region path to stdout on second line")
-	fs.Parse(args)
-	if data == "" && dataFile != "" {
-		b, err := ioutil.ReadFile(dataFile)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			return 1
-		}
-		data = string(b)
-	}
-    r, path, err := openRegion(&cf)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
-	}
-	defer r.Close()
-	chunk, cx, cz, _, _, err := loadChunk(r, cf.x, cf.z)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
-	}
-	extra := map[string]any{}
-	if err := chunkedit.MergeJSONData(extra, data); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
-	}
-	chunkedit.CreateOrUpdateBlockEntity(chunk, cf.x, cf.y, cf.z, id, extra)
-	if err := r.WriteChunkNBT(cx, cz, chunk); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
-	}
-	fmt.Println("ok")
-    if printRegion {
-        fmt.Println("region:", path)
-    } else {
-        fmt.Fprintln(os.Stderr, "region:", path)
-    }
-	return 0
-}
-
-func cmdMapDelete(args []string) int {
-	fs := flag.NewFlagSet("map delete", flag.ExitOnError)
-	var cf commonFlags
-    var printRegion bool
-    parseCommon(fs, &cf)
-    fs.BoolVar(&printRegion, "print-region", false, "Also print region path to stdout on second line")
-	fs.Parse(args)
-    r, path, err := openRegion(&cf)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
-	}
-	defer r.Close()
-	chunk, cx, cz, _, _, err := loadChunk(r, cf.x, cf.z)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
-	}
-	if !chunkedit.DeleteBlockEntity(chunk, cf.x, cf.y, cf.z) {
-		fmt.Fprintf(os.Stderr, "not found at (%d,%d,%d)\n", cf.x, cf.y, cf.z)
-		return 2
-	}
-	if err := r.WriteChunkNBT(cx, cz, chunk); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		return 1
-	}
-	fmt.Println("ok")
-    if printRegion {
-        fmt.Println("region:", path)
-    } else {
-        fmt.Fprintln(os.Stderr, "region:", path)
-    }
-	return 0
-}
-
-func usage() {
-	fmt.Fprintf(os.Stderr, "Usage: nbt-cli map <get|create|delete> [options]\n")
-	fmt.Fprintf(os.Stderr, "  Common flags: --region-dir DIR | --region-file FILE --x X --y Y --z Z\n")
-    fmt.Fprintf(os.Stderr, "  get flags: --print-region (also print region path to stdout)\n")
-    fmt.Fprintf(os.Stderr, "  create flags: --id ID [--data JSON | --data-file PATH] [--print-region]\n")
-    fmt.Fprintf(os.Stderr, "  delete flags: [--print-region]\n")
-}
-
 func main() {
-	if len(os.Args) < 2 {
-		usage()
-		os.Exit(1)
-	}
-	switch os.Args[1] {
-	case "map":
-		if len(os.Args) < 3 {
-			usage()
-			os.Exit(1)
+	rootCmd := newRootCmd()
+	if err := rootCmd.Execute(); err != nil {
+		if ec, ok := err.(exitCoder); ok {
+			if msg := err.Error(); msg != "" {
+				fmt.Fprintln(os.Stderr, msg)
+			}
+			os.Exit(ec.ExitCode())
 		}
-		sub := os.Args[2]
-		var code int
-		switch sub {
-		case "get":
-			code = cmdMapGet(os.Args[3:])
-		case "create":
-			code = cmdMapCreate(os.Args[3:])
-		case "delete":
-			code = cmdMapDelete(os.Args[3:])
-		default:
-			usage()
-			code = 1
-		}
-		os.Exit(code)
-	default:
-		usage()
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
-
-
