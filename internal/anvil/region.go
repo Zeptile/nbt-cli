@@ -13,8 +13,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Tnze/go-mc/nbt"
 	"nbt-cli/internal/coords"
+
+	"github.com/Tnze/go-mc/nbt"
 )
 
 const sectorSize = 4096
@@ -113,7 +114,7 @@ func (r *Region) buildUsedSectors() ([]bool, error) {
 	if err != nil {
 		return nil, err
 	}
-	for i := 0; i < 1024; i++ {
+	for i := range 1024 {
 		entry := loc[i*4 : i*4+4]
 		off := int(entry[0])<<16 | int(entry[1])<<8 | int(entry[2])
 		cnt := int(entry[3])
